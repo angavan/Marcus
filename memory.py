@@ -1,5 +1,8 @@
 """
-memory.py — SQLite persistence: user profiles, conversation history, menu state.
+memory.py — SQLite for session state only.
+
+Identity, memory, and conversation history now live in workspace files (workspace.py).
+This module tracks: menu navigation state, schedule config, message count, last seen.
 """
 import json
 import sqlite3
@@ -8,34 +11,18 @@ from typing import Optional
 
 DB_PATH = "marcus.db"
 
-DEFAULT_PROFILE = {
-    "name": None,
-    "timezone": "UTC",
-    "occupation": None,
-    "goals": {
-        "short_term": [],
-        "long_term": [],
-        "dreams": [],
-    },
-    "preferences": {
-        "interests": [],
-        "values": [],
-        "communication_style": "direct",
-    },
-    "schedule": {
-        "morning_time": "07:00",
-        "midday_time": "12:00",
-        "evening_time": "21:00",
-        "weekly_day": "sunday",
-        "weekly_time": "19:00",
-        "monday_time": "08:00",
-        "morning_enabled": True,
-        "midday_enabled": True,
-        "evening_enabled": True,
-        "weekly_enabled": True,
-        "monday_enabled": True,
-    },
-    "context_notes": "",
+DEFAULT_SCHEDULE = {
+    "morning_time": "07:00",
+    "midday_time": "12:00",
+    "evening_time": "21:00",
+    "weekly_day": "sunday",
+    "weekly_time": "19:00",
+    "monday_time": "08:00",
+    "morning_enabled": True,
+    "midday_enabled": True,
+    "evening_enabled": True,
+    "weekly_enabled": True,
+    "monday_enabled": True,
 }
 
 
@@ -44,23 +31,13 @@ def init_db():
         conn.executescript("""
             PRAGMA journal_mode=WAL;
 
-            CREATE TABLE IF NOT EXISTS users (
-                phone            TEXT PRIMARY KEY,
-                profile          TEXT NOT NULL DEFAULT '{}',
-                menu_state       TEXT,
-                menu_state_data  TEXT,
-                msg_count        INTEGER DEFAULT 0,
-                created_at       TEXT DEFAULT (datetime('now')),
-                last_seen        TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone      TEXT NOT NULL,
-                role       TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY(phone) REFERENCES users(phone)
+            CREATE TABLE IF NOT EXISTS sessions (
+                phone           TEXT PRIMARY KEY,
+                menu_state      TEXT,
+                menu_state_data TEXT,
+                schedule        TEXT NOT NULL DEFAULT '{}',
+                msg_count       INTEGER DEFAULT 0,
+                last_seen       TEXT DEFAULT (datetime('now'))
             );
         """)
 
@@ -79,83 +56,57 @@ def get_conn():
         conn.close()
 
 
-def _row_to_user(row) -> dict:
+def _row_to_session(row) -> dict:
     d = dict(row)
-    d["profile"] = json.loads(d["profile"])
+    schedule_raw = json.loads(d.get("schedule") or "{}")
+    d["schedule"] = {**DEFAULT_SCHEDULE, **schedule_raw}
     if d.get("menu_state_data"):
         d["menu_state_data"] = json.loads(d["menu_state_data"])
     return d
 
 
-def get_user(phone: str) -> Optional[dict]:
+def get_session(phone: str) -> Optional[dict]:
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
-        return _row_to_user(row) if row else None
+        row = conn.execute("SELECT * FROM sessions WHERE phone = ?", (phone,)).fetchone()
+        return _row_to_session(row) if row else None
 
 
-def create_user(phone: str) -> dict:
-    import copy
-    profile = copy.deepcopy(DEFAULT_PROFILE)
+def create_session(phone: str) -> dict:
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO users (phone, profile) VALUES (?, ?)",
-            (phone, json.dumps(profile)),
+            "INSERT INTO sessions (phone, schedule) VALUES (?, ?)",
+            (phone, json.dumps(DEFAULT_SCHEDULE)),
         )
-    return get_user(phone)
-
-
-def update_profile(phone: str, profile: dict):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET profile = ?, last_seen = datetime('now') WHERE phone = ?",
-            (json.dumps(profile), phone),
-        )
+    return get_session(phone)
 
 
 def set_menu_state(phone: str, state: Optional[str], data: Optional[dict] = None):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE users SET menu_state = ?, menu_state_data = ? WHERE phone = ?",
+            "UPDATE sessions SET menu_state = ?, menu_state_data = ? WHERE phone = ?",
             (state, json.dumps(data) if data else None, phone),
         )
 
 
-def add_message(phone: str, role: str, content: str):
+def update_schedule(phone: str, schedule: dict):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO messages (phone, role, content) VALUES (?, ?, ?)",
-            (phone, role, content),
+            "UPDATE sessions SET schedule = ?, last_seen = datetime('now') WHERE phone = ?",
+            (json.dumps(schedule), phone),
         )
+
+
+def increment_msg(phone: str) -> int:
+    with get_conn() as conn:
         conn.execute(
-            "UPDATE users SET msg_count = msg_count + 1, last_seen = datetime('now') WHERE phone = ?",
+            "UPDATE sessions SET msg_count = msg_count + 1, last_seen = datetime('now') WHERE phone = ?",
             (phone,),
         )
+        row = conn.execute("SELECT msg_count FROM sessions WHERE phone = ?", (phone,)).fetchone()
+        return row["msg_count"] if row else 0
 
 
-def get_history(phone: str, limit: int = 15) -> list[dict]:
+def get_all_sessions() -> list[dict]:
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT role, content FROM messages
-               WHERE phone = ?
-               ORDER BY created_at DESC
-               LIMIT ?""",
-            (phone, limit),
-        ).fetchall()
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
-
-
-def get_all_users() -> list[dict]:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM users").fetchall()
-    return [_row_to_user(r) for r in rows]
-
-
-def prune_history(phone: str, keep: int = 500):
-    """Delete oldest messages beyond `keep` for a user. Call periodically to bound table growth."""
-    with get_conn() as conn:
-        conn.execute(
-            """DELETE FROM messages WHERE phone = ? AND id NOT IN (
-                SELECT id FROM messages WHERE phone = ? ORDER BY id DESC LIMIT ?
-            )""",
-            (phone, phone, keep),
-        )
+        rows = conn.execute("SELECT * FROM sessions").fetchall()
+    return [_row_to_session(r) for r in rows]

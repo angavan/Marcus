@@ -3,8 +3,8 @@ marcus_ai.py — Claude API calls for Marcus. All prompts live in prompts.py.
 
 Models:
   CHAT — claude-haiku-4-5-20251001  (reactive chat: fast, cheap)
-  TASK — claude-sonnet-4-6          (proactive messages, analysis, extraction)
-  DEEP — claude-opus-4-6            (user-requested only)
+  TASK — claude-sonnet-4-6          (proactive messages, analysis, onboarding parsing)
+  DEEP — claude-opus-4-6            (user-requested only — prefix message with "deep:")
 """
 import json
 import os
@@ -40,52 +40,7 @@ def _parse_json(text: str) -> dict:
     return {}
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
-
-def chat(profile: dict, history: list[dict], user_message: str, *, deep: bool = False) -> str:
-    """Reactive chat. Uses Haiku by default; Opus when deep=True."""
-    model = DEEP if deep else CHAT
-    return _call(
-        model,
-        history + [{"role": "user", "content": user_message}],
-        system=prompts.build_system(profile),
-    )
-
-
-def generate_proactive(profile: dict, msg_type: str) -> str:
-    """Scheduled proactive message (morning/midday/evening/weekly/monday). Uses Sonnet."""
-    return _call(
-        TASK,
-        [{"role": "user", "content": prompts.proactive_prompt(profile, msg_type)}],
-        system=prompts.build_system(profile),
-        max_tokens=350,
-    )
-
-
-def extract_notes(profile: dict, history: list[dict]) -> Optional[str]:
-    """Extract long-term learnings from recent history. Uses Sonnet. Returns updated notes or None."""
-    if not history:
-        return None
-    result = _call(
-        TASK,
-        [{"role": "user", "content": prompts.extract_prompt(profile, history)}],
-        max_tokens=200,
-    )
-    if result.lower().startswith("nothing new"):
-        return None
-    current = profile.get("context_notes", "")
-    return f"{current}\n{result}".strip() if current else result
-
-
-def parse_intake(answers: str) -> dict:
-    """Parse free-form onboarding answers into a structured profile dict. Uses Sonnet."""
-    result = _call(
-        TASK,
-        [{"role": "user", "content": prompts.intake_parse_prompt(answers)}],
-        max_tokens=800,
-    )
-    return _parse_json(result)
-
+# ── Onboarding helpers ─────────────────────────────────────────────────────────
 
 def parse_basics(text: str) -> dict:
     """Extract name and location from natural text like 'John, New York'. Uses Haiku."""
@@ -111,3 +66,22 @@ def resolve_timezone(location: str) -> str:
     )
     tz = result.strip()
     return tz if tz in pytz.all_timezones else "UTC"
+
+
+def write_identity(name: str, timezone: str, answers: str) -> str:
+    """Generate IDENTITY.md Markdown from onboarding answers. Uses Sonnet."""
+    return _call(
+        TASK,
+        [{"role": "user", "content": prompts.identity_md_prompt(name, timezone, answers)}],
+        max_tokens=1000,
+    )
+
+
+# ── Scheduled proactive messages ───────────────────────────────────────────────
+
+def generate_proactive(phone: str, msg_type: str) -> str:
+    """Generate a scheduled proactive message using workspace context. Uses Sonnet."""
+    import workspace as ws
+    system = ws.assemble_context(phone)
+    prompt = prompts.proactive_prompt(msg_type)
+    return _call(TASK, [{"role": "user", "content": prompt}], system=system, max_tokens=350)
