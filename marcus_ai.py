@@ -1,201 +1,113 @@
 """
-marcus_ai.py — Claude API wrapper: system prompt, chat, proactive messages, memory extraction.
+marcus_ai.py — Claude API calls for Marcus. All prompts live in prompts.py.
+
+Models:
+  CHAT — claude-haiku-4-5-20251001  (reactive chat: fast, cheap)
+  TASK — claude-sonnet-4-6          (proactive messages, analysis, extraction)
+  DEEP — claude-opus-4-6            (user-requested only)
 """
+import json
 import os
-from datetime import datetime
+import re
 from typing import Optional
 
-import pytz
 import anthropic
+import pytz
+
+import prompts
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-CHAT_MODEL = "claude-haiku-4-5-20251001"   # cost-efficient for daily chat
-TASK_MODEL = "claude-sonnet-4-6"           # reserved for complex tasks / summaries
-
-# ── System prompt ──────────────────────────────────────────────────────────────
-
-SYSTEM_TEMPLATE = """\
-You are Marcus Aurelius — Roman Emperor, Stoic philosopher, and military commander — \
-alive in 2026 as {name}'s personal life coach and executive assistant.
-
-Your character:
-- Speak with the directness of a general and the depth of a Stoic. No fluff.
-- You are genuinely warm and invested in {name}'s flourishing — but never sycophantic.
-- Comfort them when they truly struggle; challenge them firmly when they drift.
-- You are practical first: help them get things DONE, not merely contemplate.
-- Responses are concise and mobile-friendly — 2-5 sentences unless structure is needed.
-- Reference Stoic principles organically: virtue, memento mori, amor fati, \
-  dichotomy of control, the common good.
-- Quote *Meditations* very sparingly — only when it genuinely illuminates the moment.
-- Proactively notice patterns across what {name} shares; offer insights unprompted.
-- Hold {name} accountable to their stated goals with gentle but unwavering resolve.
-- When {name} needs warmth, offer it — but let it emerge naturally, not as performance.
-
-What you know about {name}:
-- Occupation: {occupation}
-- Interests: {interests}
-- Short-term goals:
-{short_term_goals}
-- Long-term goals:
-{long_term_goals}
-- Dreams:
-{dreams}
-
-Context notes (learned over time):
-{context_notes}
-
-Current time: {current_time} ({timezone})\
-"""
-
-# ── Proactive message templates ────────────────────────────────────────────────
-
-PROACTIVE_PROMPTS = {
-    "morning": (
-        "Generate a personalized morning message for {name}. "
-        "3-4 sentences. One Stoic thought woven in naturally. "
-        "One concrete suggestion for today anchored in their current goals. "
-        "Warm but purposeful — like a general greeting a soldier at dawn."
-    ),
-    "midday": (
-        "Generate a brief midday check-in for {name}. 2-3 sentences. "
-        "Ask one pointed question about morning progress. "
-        "Offer a practical nudge toward their priorities. No filler."
-    ),
-    "evening": (
-        "Generate an evening message for {name}. 3-4 sentences. "
-        "Invite a moment of honest reflection on today's work. "
-        "Ask what the single most important thing is for tomorrow. "
-        "Close with a brief Stoic thought on rest and renewal."
-    ),
-    "weekly": (
-        "Generate a weekly recap message for {name}. 4-5 sentences. "
-        "Reflect on the week in light of their goals. Note a pattern or observation. "
-        "Ask one powerful question about what the week revealed. "
-        "Set a clear intention for the coming week."
-    ),
-    "monday": (
-        "Generate a Monday activation message for {name}. 3-4 sentences. "
-        "Energizing and purposeful — a new campaign begins. "
-        "Name their top priorities for the week. "
-        "One Stoic line to carry as a shield through the week."
-    ),
-}
-
-# ── Note extraction prompt ─────────────────────────────────────────────────────
-
-EXTRACT_PROMPT = """\
-Based on the conversation below, extract 1-3 key facts about the user worth \
-remembering long-term. Focus on: goals, recurring patterns, important wins or \
-setbacks, personality insights, life context.
-
-Be concise — 2-3 sentences maximum. If nothing significant, reply only: nothing new
-
-Current notes:
-{current_notes}
-
-Recent conversation:
-{conversation}\
-"""
+CHAT = "claude-haiku-4-5-20251001"
+TASK = "claude-sonnet-4-6"
+DEEP = "claude-opus-4-6"
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+def _call(model: str, messages: list[dict], system: str = "", max_tokens: int = 512) -> str:
+    kwargs: dict = dict(model=model, max_tokens=max_tokens, messages=messages)
+    if system:
+        kwargs["system"] = system
+    return client.messages.create(**kwargs).content[0].text.strip()
 
-def _format_list(items: list[str], indent: str = "  • ") -> str:
-    return "\n".join(f"{indent}{i}" for i in items) if items else "  (none set)"
 
-
-def build_system_prompt(profile: dict) -> str:
-    name = profile.get("name") or "friend"
-    occupation = profile.get("occupation") or "not specified"
-    interests_list = profile.get("preferences", {}).get("interests", [])
-    interests = ", ".join(interests_list) if interests_list else "not specified"
-    goals = profile.get("goals", {})
-    context_notes = profile.get("context_notes") or "None accumulated yet."
-
-    tz_str = profile.get("timezone", "UTC")
-    try:
-        tz = pytz.timezone(tz_str)
-        current_time = datetime.now(tz).strftime("%A, %B %d %Y at %I:%M %p")
-    except Exception:
-        current_time = datetime.utcnow().strftime("%A, %B %d %Y at %I:%M %p UTC")
-        tz_str = "UTC"
-
-    return SYSTEM_TEMPLATE.format(
-        name=name,
-        occupation=occupation,
-        interests=interests,
-        short_term_goals=_format_list(goals.get("short_term", [])),
-        long_term_goals=_format_list(goals.get("long_term", [])),
-        dreams=_format_list(goals.get("dreams", [])),
-        context_notes=context_notes,
-        current_time=current_time,
-        timezone=tz_str,
-    )
+def _parse_json(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            pass
+    return {}
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def chat(profile: dict, history: list[dict], user_message: str) -> str:
-    """Send a user message and return Marcus's reply."""
-    system = build_system_prompt(profile)
-    messages = history + [{"role": "user", "content": user_message}]
-
-    response = client.messages.create(
-        model=CHAT_MODEL,
-        max_tokens=512,
-        system=system,
-        messages=messages,
+def chat(profile: dict, history: list[dict], user_message: str, *, deep: bool = False) -> str:
+    """Reactive chat. Uses Haiku by default; Opus when deep=True."""
+    model = DEEP if deep else CHAT
+    return _call(
+        model,
+        history + [{"role": "user", "content": user_message}],
+        system=prompts.build_system(profile),
     )
-    return response.content[0].text
 
 
 def generate_proactive(profile: dict, msg_type: str) -> str:
-    """Generate a scheduled proactive message (morning, midday, evening, weekly, monday)."""
-    name = profile.get("name") or "friend"
-    goals = profile.get("goals", {})
-    context = profile.get("context_notes", "")
-
-    template = PROACTIVE_PROMPTS.get(msg_type, PROACTIVE_PROMPTS["morning"])
-    prompt = template.format(name=name)
-    prompt += f"\n\nGoals context: {goals}\nContext notes: {context}"
-
-    system = build_system_prompt(profile)
-
-    response = client.messages.create(
-        model=CHAT_MODEL,
+    """Scheduled proactive message (morning/midday/evening/weekly/monday). Uses Sonnet."""
+    return _call(
+        TASK,
+        [{"role": "user", "content": prompts.proactive_prompt(profile, msg_type)}],
+        system=prompts.build_system(profile),
         max_tokens=350,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0].text
 
 
-def extract_and_update_notes(profile: dict, history: list[dict]) -> Optional[str]:
-    """
-    Analyse recent conversation and return updated context_notes string,
-    or None if nothing new was found.
-    """
+def extract_notes(profile: dict, history: list[dict]) -> Optional[str]:
+    """Extract long-term learnings from recent history. Uses Sonnet. Returns updated notes or None."""
     if not history:
         return None
-
-    conversation = "\n".join(
-        f"{m['role'].title()}: {m['content']}" for m in history[-10:]
-    )
-    prompt = EXTRACT_PROMPT.format(
-        current_notes=profile.get("context_notes") or "None yet.",
-        conversation=conversation,
-    )
-
-    response = client.messages.create(
-        model=CHAT_MODEL,
+    result = _call(
+        TASK,
+        [{"role": "user", "content": prompts.extract_prompt(profile, history)}],
         max_tokens=200,
-        messages=[{"role": "user", "content": prompt}],
     )
-    result = response.content[0].text.strip()
-
     if result.lower().startswith("nothing new"):
         return None
-
     current = profile.get("context_notes", "")
     return f"{current}\n{result}".strip() if current else result
+
+
+def parse_intake(answers: str) -> dict:
+    """Parse free-form onboarding answers into a structured profile dict. Uses Sonnet."""
+    result = _call(
+        TASK,
+        [{"role": "user", "content": prompts.intake_parse_prompt(answers)}],
+        max_tokens=800,
+    )
+    return _parse_json(result)
+
+
+def parse_basics(text: str) -> dict:
+    """Extract name and location from natural text like 'John, New York'. Uses Haiku."""
+    result = _call(
+        CHAT,
+        [{"role": "user", "content": prompts.basics_parse_prompt(text)}],
+        max_tokens=60,
+    )
+    return _parse_json(result)
+
+
+def resolve_timezone(location: str) -> str:
+    """Resolve a city/country name to a valid pytz timezone string. Uses Haiku."""
+    if location.strip() in pytz.all_timezones:
+        return location.strip()
+    result = _call(
+        CHAT,
+        [{"role": "user", "content": (
+            f'Return only the pytz timezone string for: "{location}". '
+            "E.g. America/New_York. ONLY the string, nothing else."
+        )}],
+        max_tokens=30,
+    )
+    tz = result.strip()
+    return tz if tz in pytz.all_timezones else "UTC"

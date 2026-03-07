@@ -45,15 +45,10 @@ async def health():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """
-    Receive an inbound WhatsApp message from Twilio and reply with TwiML.
-    Twilio sends a form-encoded POST with 'From' and 'Body' fields.
-    """
+    """Receive an inbound WhatsApp message from Twilio and reply with TwiML."""
+    from whatsapp import parse_webhook
     form = await request.form()
-    form_data = dict(form)
-
-    phone = form_data.get("From", "").replace("whatsapp:", "").strip()
-    body = form_data.get("Body", "").strip()
+    phone, body = parse_webhook(dict(form))
 
     if not phone or not body:
         return Response(content=_twiml(""), media_type="application/xml")
@@ -66,25 +61,9 @@ async def webhook(request: Request):
         logger.exception("Unhandled error for %s", phone)
         reply = "Something went wrong on my end. Type *menu* to reset."
 
-    # After onboarding completes, register scheduler jobs if not yet done
-    _maybe_schedule(phone)
-
     return Response(content=_twiml(reply), media_type="application/xml")
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _twiml(message: str) -> str:
     safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{safe}</Message></Response>"
-
-
-def _maybe_schedule(phone: str):
-    """Register scheduler jobs for a user the first time they complete onboarding."""
-    user = memory.get_user(phone)
-    if not user or not user["profile"].get("name") or user.get("menu_state"):
-        return
-    existing = [j for j in sched.scheduler.get_jobs() if j.id.startswith(f"{phone}_")]
-    if not existing:
-        sched.schedule_user(phone, user["profile"])
-        logger.info("Scheduled jobs registered for %s", phone)

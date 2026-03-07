@@ -19,6 +19,7 @@ DEFAULT_PROFILE = {
     },
     "preferences": {
         "interests": [],
+        "values": [],
         "communication_style": "direct",
     },
     "schedule": {
@@ -147,3 +148,14 @@ def get_all_users() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM users").fetchall()
     return [_row_to_user(r) for r in rows]
+
+
+def prune_history(phone: str, keep: int = 500):
+    """Delete oldest messages beyond `keep` for a user. Call periodically to bound table growth."""
+    with get_conn() as conn:
+        conn.execute(
+            """DELETE FROM messages WHERE phone = ? AND id NOT IN (
+                SELECT id FROM messages WHERE phone = ? ORDER BY id DESC LIMIT ?
+            )""",
+            (phone, phone, keep),
+        )

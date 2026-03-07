@@ -3,30 +3,35 @@ menu.py — WhatsApp message routing and menu state machine.
 
 States
 ------
-None                → free chat mode (default)
-"main"              → main menu shown, awaiting selection
-"setup:name"        → onboarding: waiting for name
-"setup:timezone"    → onboarding: waiting for timezone
-"setup:goals"       → onboarding: waiting for first goal
-"goals:main"        → goals submenu
-"goals:add_text"    → waiting for new goal text
-"goals:add_type"    → waiting for goal category selection
-"goals:add_dream"   → waiting for dream text
-"goals:remove"      → waiting for goal number to remove
-"schedule:main"     → schedule submenu
+None                  → free chat (default)
+"main"                → main menu shown
+"setup:basics"        → onboarding step 1 — name + location
+"setup:intake"        → onboarding step 2 — 5 deep questions (bulk)
+"setup:confirm"       → onboarding step 3 — show parsed profile, await confirmation
+"goals:main"          → goals submenu
+"goals:add_text"      → waiting for goal text
+"goals:add_type"      → waiting for goal category (1/2/3)
+"goals:add_dream"     → waiting for dream text
+"goals:remove"        → waiting for goal number to remove
+"schedule:main"       → schedule submenu
 "schedule:edit_times" → waiting for time slot selection
-"schedule:set_time" → waiting for HH:MM input
-"settings:main"     → settings submenu
-"settings:name"     → waiting for new name
-"settings:timezone" → waiting for new timezone
+"schedule:set_time"   → waiting for HH:MM input
+"settings:main"       → settings submenu
+"settings:name"       → waiting for new name
+"settings:timezone"   → waiting for new timezone
 "settings:occupation" → waiting for occupation
-"settings:interests" → waiting for interests list
+"settings:interests"  → waiting for interests list
 """
+import logging
 import re
-from typing import Optional
 
-import memory
+import pytz
+
 import marcus_ai
+import memory
+import scheduler as sched
+
+logger = logging.getLogger(__name__)
 
 # ── Menu strings ───────────────────────────────────────────────────────────────
 
@@ -82,31 +87,6 @@ What type of goal is this?
 *3* — Dream (life aspiration)\
 """
 
-TIMEZONE_PROMPT = """\
-Type your timezone in standard format. Examples:
-• America/New_York
-• Europe/London
-• Asia/Tokyo
-• America/Los_Angeles
-• UTC
-
-*Type your timezone:*\
-"""
-
-ONBOARDING_WELCOME = """\
-📜 *I am Marcus.*
-Not a ghost — but a spirit forged from two millennia of hard-won wisdom, \
-put to work in your service.
-
-I will serve as your life coach, strategist, and executive assistant. \
-I will remember what matters to you, check in daily, and hold you \
-accountable to your highest ambitions.
-
-To serve you well, I must first know you.
-
-*What is your name?*\
-"""
-
 HELP_TEXT = """\
 📜 *MARCUS — Help*
 
@@ -114,97 +94,150 @@ Type *menu* anytime — main menu.
 Type *help* — this message.
 
 What I do:
-• Chat with you, remember context across conversations
-• Track your goals and dreams
-• Send daily check-ins (morning, midday, evening)
-• Send weekly recaps and Monday updates
+• Chat and remember context across conversations
+• Track your goals, dreams, and values
+• Daily check-ins: morning, midday, evening
+• Weekly recaps and Monday activations
 • Proactively offer insights without being asked
 
 I am not a chatbot. I am your ally.\
 """
 
+ONBOARDING_WELCOME = """\
+📜 *I am Marcus.*
+Not a ghost — the spirit of two millennia of hard-won wisdom, put to work in your service.
+
+I will be your life coach, strategist, and executive assistant. I will remember what matters, \
+check in daily, and hold you accountable to your highest ambitions.
+
+First: *what's your name, and where in the world are you?*
+_(e.g. "John, New York" or "Maria in London")_\
+"""
+
+INTAKE_QUESTIONS = """\
+Good, *{name}*.
+
+Now — answer these as openly as you can. This is how I build my first picture of you.
+
+*1.* What do you do? (work, business, study — describe it briefly)
+*2.* What are your current goals — the ones you think about most?
+*3.* What are your deeper dreams or long-term ambitions?
+*4.* What are your biggest current challenges or obstacles?
+*5.* What do you value most in life? What principles guide you?
+
+Write freely. Take your time. I'll build your profile from what you give me.\
+"""
+
+CONFIRM_TEMPLATE = """\
+📜 *Here's my first picture of you:*
+
+*{name}* | {occupation}
+*Timezone:* {timezone}
+
+*Short-term goals:*
+{short_term}
+
+*Long-term goals:*
+{long_term}
+
+*Dreams:*
+{dreams}
+
+*Values:* {values}
+*Interests:* {interests}
+
+*My first read:* {context_notes}
+
+Does this capture you accurately? Say *"looks good"* to continue, or tell me what to correct.\
+"""
+
+_CONFIRM_YES = {"yes", "looks good", "good", "correct", "ok", "done", "perfect", "yep", "right",
+                "confirmed", "that's right", "all good", "accurate"}
+
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def handle_message(phone: str, text: str) -> str:
-    """Route an incoming WhatsApp message and return a reply string."""
     text = text.strip()
     lower = text.lower()
 
-    # Get or create user
     user = memory.get_user(phone)
     if not user:
         user = memory.create_user(phone)
-        memory.set_menu_state(phone, "setup:name")
+        memory.set_menu_state(phone, "setup:basics")
         return ONBOARDING_WELCOME
 
     menu_state = user.get("menu_state")
 
-    # ── Global shortcuts (always work) ──────────────────────────────────────
+    # Global shortcuts
     if lower in ("menu", "home", "start"):
         memory.set_menu_state(phone, "main")
         return MAIN_MENU
-
     if lower in ("help", "?"):
         return HELP_TEXT
 
-    # ── Onboarding ──────────────────────────────────────────────────────────
     if menu_state and menu_state.startswith("setup:"):
         return _handle_setup(phone, user, text)
-
-    # ── Menu navigation ─────────────────────────────────────────────────────
     if menu_state:
         return _handle_menu_nav(phone, user, text)
 
-    # ── Free chat ───────────────────────────────────────────────────────────
     return _handle_chat(phone, user, text)
 
 
-# ── Onboarding flow ────────────────────────────────────────────────────────────
+# ── Onboarding ─────────────────────────────────────────────────────────────────
 
 def _handle_setup(phone: str, user: dict, text: str) -> str:
     state = user["menu_state"]
     profile = user["profile"]
+    data = user.get("menu_state_data") or {}
 
-    if state == "setup:name":
-        name = text.strip().split()[0].capitalize()
+    if state == "setup:basics":
+        parsed = marcus_ai.parse_basics(text)
+        name = parsed.get("name", text.strip().split()[0]).capitalize()
+        tz = marcus_ai.resolve_timezone(parsed.get("location", text))
         profile["name"] = name
+        profile["timezone"] = tz
         memory.update_profile(phone, profile)
-        memory.set_menu_state(phone, "setup:timezone")
-        return f"Good. *{name}*.\n\n" + TIMEZONE_PROMPT
+        memory.set_menu_state(phone, "setup:intake")
+        return INTAKE_QUESTIONS.format(name=name)
 
-    if state == "setup:timezone":
-        import pytz
-        tz_input = text.strip()
-        if tz_input not in pytz.all_timezones:
+    if state == "setup:intake":
+        parsed = marcus_ai.parse_intake(text)
+        if parsed:
+            # Merge parsed data; protect name + timezone already collected in basics
+            for key, val in parsed.items():
+                if key not in ("name", "timezone"):
+                    profile[key] = val
+        memory.update_profile(phone, profile)
+        memory.set_menu_state(phone, "setup:confirm", {"intake_text": text})
+        return _format_confirm(profile)
+
+    if state == "setup:confirm":
+        if any(w in text.lower() for w in _CONFIRM_YES) or text.lower() in _CONFIRM_YES:
+            memory.set_menu_state(phone, None)
+            try:
+                sched.schedule_user(phone, profile)
+            except Exception:
+                logger.warning("Failed to schedule jobs for %s after onboarding", phone)
+            name = profile.get("name", "friend")
             return (
-                f"I don't recognize *{tz_input}*. Use a standard format:\n"
-                "• America/New_York\n• Europe/London\n• Asia/Tokyo\n\n"
-                "*Try again:*"
+                f"📜 *Profile saved, {name}.*\n\n"
+                "You can update anything via menu → Settings.\n\n"
+                "I'll reach out each morning, midday, and evening. "
+                f"The work begins now, {name}."
             )
-        profile["timezone"] = tz_input
-        memory.update_profile(phone, profile)
-        memory.set_menu_state(phone, "setup:goals")
-        return (
-            f"Noted — *{tz_input}*.\n\n"
-            f"Now, *{profile['name']}* — what is your single most important goal "
-            "right now? Speak plainly. You can add more later."
+        # Treat message as correction — re-parse original answers + correction
+        original_text = data.get("intake_text", "")
+        corrected = marcus_ai.parse_intake(
+            f"Original answers:\n{original_text}\n\nUser correction: {text}"
         )
-
-    if state == "setup:goals":
-        profile["goals"]["short_term"].append(text.strip())
+        if corrected:
+            for key, val in corrected.items():
+                if key not in ("name", "timezone"):
+                    profile[key] = val
         memory.update_profile(phone, profile)
-        memory.set_menu_state(phone, None)
-        name = profile["name"]
-        return (
-            f"Noted. I will hold you to this.\n\n"
-            f"📜 *Setup complete, {name}.*\n\n"
-            "• Just type to talk to me\n"
-            "• Type *menu* to navigate\n"
-            "• Add more goals via menu → Goals\n\n"
-            f"I will reach out each morning, midday, and evening. "
-            f"The work begins now, {name}."
-        )
+        memory.set_menu_state(phone, "setup:confirm", {"intake_text": original_text})
+        return "✓ Updated.\n\n" + _format_confirm(profile)
 
     return "Something went wrong. Type *menu* to reset."
 
@@ -215,19 +248,16 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
     state = user["menu_state"]
     profile = user["profile"]
     data = user.get("menu_state_data") or {}
-    lower = text.lower()
 
-    # Back / cancel
-    if text == "0" or lower in ("back", "cancel", "exit"):
+    if text == "0" or text.lower() in ("back", "cancel", "exit"):
         memory.set_menu_state(phone, None)
         return MAIN_MENU
 
-    # ── Main menu ────────────────────────────────────────────────────────────
+    # ── Main ──────────────────────────────────────────────────────────────────
     if state == "main":
         if text == "1":
             memory.set_menu_state(phone, None)
-            name = profile.get("name", "friend")
-            return f"Chat mode. What's on your mind, {name}?"
+            return f"Chat mode. What's on your mind, {profile.get('name', 'friend')}?"
         if text == "2":
             memory.set_menu_state(phone, "goals:main")
             return GOALS_MENU
@@ -244,7 +274,7 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
         memory.set_menu_state(phone, None)
         return _handle_chat(phone, user, text)
 
-    # ── Goals ────────────────────────────────────────────────────────────────
+    # ── Goals ─────────────────────────────────────────────────────────────────
     if state == "goals:main":
         if text == "1":
             memory.set_menu_state(phone, None)
@@ -256,12 +286,12 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
             flat = _goals_flat(profile)
             if not flat:
                 memory.set_menu_state(phone, None)
-                return "You have no goals yet. Add one via menu → Goals → Add a goal."
+                return "You have no goals yet. Add one via menu → Goals."
             memory.set_menu_state(phone, "goals:remove")
             return f"📜 *Remove a Goal*\n\n{_goals_numbered_text(profile)}\n\nType the number to remove:"
         if text == "4":
             memory.set_menu_state(phone, "goals:add_dream")
-            return "📜 *Add a Dream*\n\nWhat life aspiration do you hold? Type it:"
+            return "📜 *Add a Dream*\n\nWhat life aspiration do you hold?"
         return GOALS_MENU
 
     if state == "goals:add_text":
@@ -270,12 +300,15 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
 
     if state == "goals:add_type":
         goal_text = data.get("goal_text", "")
-        goals = profile.setdefault("goals", {"short_term": [], "long_term": [], "dreams": []})
-        category_map = {"1": ("short_term", "short-term goals"), "2": ("long_term", "long-term goals"), "3": ("dreams", "dreams")}
+        category_map = {
+            "1": ("short_term", "short-term goals"),
+            "2": ("long_term", "long-term goals"),
+            "3": ("dreams", "dreams"),
+        }
         if text not in category_map:
             return GOAL_TYPE_PROMPT
         cat_key, cat_label = category_map[text]
-        goals[cat_key].append(goal_text)
+        profile["goals"].setdefault(cat_key, []).append(goal_text)
         memory.update_profile(phone, profile)
         memory.set_menu_state(phone, None)
         return f"✓ Added to your {cat_label}.\n\n_{goal_text}_\n\nHold yourself to it."
@@ -300,7 +333,7 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
         except ValueError:
             return "Type a number. Type *0* to cancel."
 
-    # ── Schedule ─────────────────────────────────────────────────────────────
+    # ── Schedule ──────────────────────────────────────────────────────────────
     if state == "schedule:main":
         schedule = profile.setdefault("schedule", {})
         if text == "1":
@@ -316,7 +349,6 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
         if text in toggle_map:
             key, label = toggle_map[text]
             schedule[key] = not schedule.get(key, True)
-            profile["schedule"] = schedule
             memory.update_profile(phone, profile)
             memory.set_menu_state(phone, None)
             word = "enabled" if schedule[key] else "disabled"
@@ -326,11 +358,11 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
             memory.set_menu_state(phone, "schedule:edit_times")
             return (
                 "📜 *Edit Message Times*\n\n"
-                f"*1* — Morning (currently {s.get('morning_time','07:00')})\n"
-                f"*2* — Midday (currently {s.get('midday_time','12:00')})\n"
-                f"*3* — Evening (currently {s.get('evening_time','21:00')})\n"
-                f"*4* — Weekly (currently {s.get('weekly_time','19:00')} on {s.get('weekly_day','sunday').capitalize()})\n"
-                f"*5* — Monday (currently {s.get('monday_time','08:00')})\n"
+                f"*1* — Morning  (currently {s.get('morning_time','07:00')})\n"
+                f"*2* — Midday   (currently {s.get('midday_time','12:00')})\n"
+                f"*3* — Evening  (currently {s.get('evening_time','21:00')})\n"
+                f"*4* — Weekly   (currently {s.get('weekly_day','Sunday').capitalize()} {s.get('weekly_time','19:00')})\n"
+                f"*5* — Monday   (currently {s.get('monday_time','08:00')})\n"
                 "*0* — Back"
             )
         return SCHEDULE_MENU
@@ -354,55 +386,47 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
             return "Invalid format. Use HH:MM (e.g. 07:30). Try again:"
         time_key = data.get("time_key", "morning_time")
         label = data.get("label", "")
-        schedule = profile.setdefault("schedule", {})
-        schedule[time_key] = text.strip()
-        profile["schedule"] = schedule
+        profile.setdefault("schedule", {})[time_key] = text.strip()
         memory.update_profile(phone, profile)
         memory.set_menu_state(phone, None)
-        # Kick scheduler to re-register jobs
         try:
-            import scheduler as sched
             sched.reschedule_user(phone, profile)
         except Exception:
-            pass
+            logger.warning("Failed to reschedule %s after time change", phone)
         return f"✓ {label} time set to *{text.strip()}*."
 
-    # ── Settings ─────────────────────────────────────────────────────────────
+    # ── Settings ──────────────────────────────────────────────────────────────
     if state == "settings:main":
         if text == "1":
             memory.set_menu_state(phone, "settings:name")
             return "📜 *Update Name*\n\nWhat should I call you?"
         if text == "2":
             memory.set_menu_state(phone, "settings:timezone")
-            return "📜 *Update Timezone*\n\n" + TIMEZONE_PROMPT
+            return "📜 *Update Timezone*\n\nType your city or timezone (e.g. London, America/New_York):"
         if text == "3":
             memory.set_menu_state(phone, "settings:occupation")
-            return "📜 *Update Occupation*\n\nWhat do you do? (role, industry, or brief description)"
+            return "📜 *Update Occupation*\n\nWhat do you do?"
         if text == "4":
             memory.set_menu_state(phone, "settings:interests")
             return "📜 *Update Interests*\n\nList your main interests, comma-separated:"
         return SETTINGS_MENU
 
     if state == "settings:name":
-        name = text.strip().split()[0].capitalize()
-        profile["name"] = name
+        profile["name"] = text.strip().split()[0].capitalize()
         memory.update_profile(phone, profile)
         memory.set_menu_state(phone, None)
-        return f"✓ Name updated to *{name}*."
+        return f"✓ Name updated to *{profile['name']}*."
 
     if state == "settings:timezone":
-        import pytz
-        if text.strip() in pytz.all_timezones:
-            profile["timezone"] = text.strip()
-            memory.update_profile(phone, profile)
-            memory.set_menu_state(phone, None)
-            try:
-                import scheduler as sched
-                sched.reschedule_user(phone, profile)
-            except Exception:
-                pass
-            return f"✓ Timezone set to *{text.strip()}*."
-        return f"Unknown timezone: *{text.strip()}*. Try again (e.g. America/New_York):"
+        tz = marcus_ai.resolve_timezone(text.strip())
+        profile["timezone"] = tz
+        memory.update_profile(phone, profile)
+        memory.set_menu_state(phone, None)
+        try:
+            sched.reschedule_user(phone, profile)
+        except Exception:
+            logger.warning("Failed to reschedule %s after timezone change", phone)
+        return f"✓ Timezone set to *{tz}*."
 
     if state == "settings:occupation":
         profile["occupation"] = text.strip()
@@ -417,7 +441,6 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
         memory.set_menu_state(phone, None)
         return f"✓ Interests: {', '.join(interests)}"
 
-    # Fallback
     memory.set_menu_state(phone, None)
     return MAIN_MENU
 
@@ -426,92 +449,101 @@ def _handle_menu_nav(phone: str, user: dict, text: str) -> str:
 
 def _handle_chat(phone: str, user: dict, text: str) -> str:
     profile = user["profile"]
-    history = memory.get_history(phone)
+    history = memory.get_history(phone)   # fetched once; reused for both chat and note extraction
 
     reply = marcus_ai.chat(profile, history, text)
 
     memory.add_message(phone, "user", text)
     memory.add_message(phone, "assistant", reply)
 
-    # Every 8 messages extract new learnings and update context notes
-    msg_count = user.get("msg_count", 0)
-    if msg_count > 0 and msg_count % 8 == 0:
+    # Every 8 messages, extract learnings and update context notes (Sonnet)
+    if user.get("msg_count", 0) % 8 == 0 and user.get("msg_count", 0) > 0:
         try:
-            recent = memory.get_history(phone, limit=10)
-            new_notes = marcus_ai.extract_and_update_notes(profile, recent)
+            new_notes = marcus_ai.extract_notes(profile, history[-10:])
             if new_notes:
                 profile["context_notes"] = new_notes
                 memory.update_profile(phone, profile)
         except Exception:
-            pass  # never fail a chat response due to note extraction
+            logger.warning("Note extraction failed for %s", phone)
 
     return reply
 
 
 # ── Formatting helpers ─────────────────────────────────────────────────────────
 
+def _fmt_list(items: list) -> str:
+    return "\n  • ".join(items) if items else "None"
+
+
 def _format_profile(profile: dict) -> str:
-    name = profile.get("name") or "Not set"
-    occupation = profile.get("occupation") or "Not set"
-    tz = profile.get("timezone", "UTC")
-    interests = ", ".join(profile.get("preferences", {}).get("interests", [])) or "Not set"
-    goals = profile.get("goals", {})
-    st = "\n  • ".join(goals.get("short_term", [])) or "None"
-    lt = "\n  • ".join(goals.get("long_term", [])) or "None"
-    dr = "\n  • ".join(goals.get("dreams", [])) or "None"
+    g = profile.get("goals", {})
+    p = profile.get("preferences", {})
     return (
         f"📜 *Your Profile*\n\n"
-        f"*Name:* {name}\n"
-        f"*Occupation:* {occupation}\n"
-        f"*Timezone:* {tz}\n"
-        f"*Interests:* {interests}\n\n"
-        f"*Short-term goals:*\n  • {st}\n\n"
-        f"*Long-term goals:*\n  • {lt}\n\n"
-        f"*Dreams:*\n  • {dr}\n\n"
+        f"*Name:* {profile.get('name') or 'Not set'}\n"
+        f"*Occupation:* {profile.get('occupation') or 'Not set'}\n"
+        f"*Timezone:* {profile.get('timezone', 'UTC')}\n"
+        f"*Interests:* {', '.join(p.get('interests', [])) or 'Not set'}\n"
+        f"*Values:* {', '.join(p.get('values', [])) or 'Not set'}\n\n"
+        f"*Short-term goals:*\n  • {_fmt_list(g.get('short_term', []))}\n\n"
+        f"*Long-term goals:*\n  • {_fmt_list(g.get('long_term', []))}\n\n"
+        f"*Dreams:*\n  • {_fmt_list(g.get('dreams', []))}\n\n"
         "_Type *menu* → Settings to update._"
     )
 
 
 def _format_goals(profile: dict) -> str:
-    goals = profile.get("goals", {})
-    st = "\n  • ".join(goals.get("short_term", [])) or "None set"
-    lt = "\n  • ".join(goals.get("long_term", [])) or "None set"
-    dr = "\n  • ".join(goals.get("dreams", [])) or "None set"
+    g = profile.get("goals", {})
     return (
         f"📜 *Your Goals & Dreams*\n\n"
-        f"*Short-term:*\n  • {st}\n\n"
-        f"*Long-term:*\n  • {lt}\n\n"
-        f"*Dreams:*\n  • {dr}"
+        f"*Short-term:*\n  • {_fmt_list(g.get('short_term', []))}\n\n"
+        f"*Long-term:*\n  • {_fmt_list(g.get('long_term', []))}\n\n"
+        f"*Dreams:*\n  • {_fmt_list(g.get('dreams', []))}"
     )
 
 
 def _goals_flat(profile: dict) -> list[tuple[str, str]]:
-    goals = profile.get("goals", {})
-    flat = []
-    for g in goals.get("short_term", []):
-        flat.append((g, "short_term"))
-    for g in goals.get("long_term", []):
-        flat.append((g, "long_term"))
-    for g in goals.get("dreams", []):
-        flat.append((g, "dreams"))
-    return flat
+    g = profile.get("goals", {})
+    return (
+        [(t, "short_term") for t in g.get("short_term", [])]
+        + [(t, "long_term") for t in g.get("long_term", [])]
+        + [(t, "dreams") for t in g.get("dreams", [])]
+    )
 
 
 def _goals_numbered_text(profile: dict) -> str:
-    flat = _goals_flat(profile)
     labels = {"short_term": "ST", "long_term": "LT", "dreams": "✦"}
-    return "\n".join(f"*{i+1}* [{labels[cat]}] {text}" for i, (text, cat) in enumerate(flat))
+    return "\n".join(
+        f"*{i+1}* [{labels[cat]}] {text}"
+        for i, (text, cat) in enumerate(_goals_flat(profile))
+    )
 
 
 def _format_schedule(schedule: dict) -> str:
-    def s(key):
-        return "✓" if schedule.get(key, True) else "✗"
+    def s(key): return "✓" if schedule.get(key, True) else "✗"
     return (
         f"📜 *Your Schedule*\n\n"
-        f"{s('morning_enabled')} Morning     — {schedule.get('morning_time','07:00')}\n"
-        f"{s('midday_enabled')} Midday      — {schedule.get('midday_time','12:00')}\n"
-        f"{s('evening_enabled')} Evening     — {schedule.get('evening_time','21:00')}\n"
-        f"{s('weekly_enabled')} Weekly      — {schedule.get('weekly_day','Sunday').capitalize()} {schedule.get('weekly_time','19:00')}\n"
-        f"{s('monday_enabled')} Monday      — {schedule.get('monday_time','08:00')}\n\n"
+        f"{s('morning_enabled')} Morning  — {schedule.get('morning_time','07:00')}\n"
+        f"{s('midday_enabled')} Midday   — {schedule.get('midday_time','12:00')}\n"
+        f"{s('evening_enabled')} Evening  — {schedule.get('evening_time','21:00')}\n"
+        f"{s('weekly_enabled')} Weekly   — {schedule.get('weekly_day','Sunday').capitalize()} {schedule.get('weekly_time','19:00')}\n"
+        f"{s('monday_enabled')} Monday   — {schedule.get('monday_time','08:00')}\n\n"
         "_All times in your local timezone._"
+    )
+
+
+def _format_confirm(profile: dict) -> str:
+    g = profile.get("goals", {})
+    p = profile.get("preferences", {})
+    def fmt(lst): return "\n".join(f"  • {i}" for i in lst) if lst else "  (none)"
+    return CONFIRM_TEMPLATE.format(
+        name=profile.get("name", ""),
+        occupation=profile.get("occupation") or "not specified",
+        timezone=profile.get("timezone", "UTC"),
+        short_term=fmt(g.get("short_term", [])),
+        long_term=fmt(g.get("long_term", [])),
+        dreams=fmt(g.get("dreams", [])),
+        values=", ".join(p.get("values", [])) or "not specified",
+        interests=", ".join(p.get("interests", [])) or "not specified",
+        context_notes=profile.get("context_notes") or "(none yet)",
     )
