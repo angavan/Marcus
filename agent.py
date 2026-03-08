@@ -107,10 +107,11 @@ def _execute(phone: str, tool_name: str, tool_input: dict) -> str:
     return f"Unknown tool: {tool_name}"
 
 
-def run(phone: str, user_message: str, heartbeat: bool = False) -> Optional[str]:
+def run(phone: str, user_message: str, heartbeat: bool = False, deep: bool = False) -> Optional[str]:
     """
     Run the ReAct loop for a user message.
     Returns the final text reply, or None when a heartbeat has nothing to report.
+    deep=True forces the Opus model for this request.
     """
     system = ws.assemble_context(phone, heartbeat=heartbeat)
     if not system:
@@ -122,7 +123,12 @@ def run(phone: str, user_message: str, heartbeat: bool = False) -> Optional[str]
 
     history = ws.load_history(phone, limit=20)
     messages = list(history) + [{"role": "user", "content": user_message}]
-    model = marcus_ai.TASK if heartbeat else marcus_ai.CHAT
+    if heartbeat:
+        model = marcus_ai.TASK
+    elif deep:
+        model = marcus_ai.DEEP
+    else:
+        model = marcus_ai.CHAT
 
     for iteration in range(MAX_ITERATIONS):
         response = marcus_ai.client.messages.create(

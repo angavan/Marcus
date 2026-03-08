@@ -125,7 +125,11 @@ def add_goal(phone: str, goal_text: str, section_header: str):
 
 def remove_goal(phone: str, goal_text: str):
     content = read_file(phone, "IDENTITY.md")
-    write_file(phone, "IDENTITY.md", content.replace(f"- {goal_text}\n", ""))
+    lines = [
+        line for line in content.splitlines()
+        if line.strip() not in (f"- {goal_text}", f"• {goal_text}")
+    ]
+    write_file(phone, "IDENTITY.md", "\n".join(lines))
 
 
 # ── Timezone ───────────────────────────────────────────────────────────────────

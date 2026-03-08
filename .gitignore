@@ -11,3 +11,8 @@ build/
 .venv
 env/
 venv/
+
+# Runtime data
+marcus.db
+workspace/
+transcripts/

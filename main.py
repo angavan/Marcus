@@ -7,6 +7,8 @@ GET  /health   → liveness check
 POST /webhook  → Twilio WhatsApp webhook (incoming messages)
 """
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -18,6 +20,8 @@ import memory
 import menu
 import scheduler as sched
 
+_REQUIRED_ENV = ["ANTHROPIC_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -27,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+    if missing:
+        logger.critical("Missing required environment variables: %s", ", ".join(missing))
+        sys.exit(1)
     memory.init_db()
     sched.init_scheduler()
     logger.info("Marcus is awake.")

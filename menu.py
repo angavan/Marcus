@@ -177,10 +177,13 @@ def _handle_setup(phone: str, session: dict, text: str) -> str:
 
     if state == "setup:basics":
         parsed = marcus_ai.parse_basics(text)
-        name = parsed.get("name", text.strip().split()[0]).capitalize()
+        words = text.strip().split()
+        fallback_name = words[0] if words else "friend"
+        name = parsed.get("name", fallback_name).capitalize() or "friend"
         tz = marcus_ai.resolve_timezone(parsed.get("location", text))
+        tz_note = f"\n_(Timezone set to {tz} — you can change this in Settings if needed.)_" if tz == "UTC" else ""
         memory.set_menu_state(phone, "setup:intake", {"name": name, "timezone": tz})
-        return INTAKE_QUESTIONS.format(name=name)
+        return INTAKE_QUESTIONS.format(name=name) + tz_note
 
     if state == "setup:intake":
         name = data.get("name", "friend")
@@ -391,7 +394,10 @@ def _handle_menu_nav(phone: str, session: dict, text: str) -> str:
         return SETTINGS_MENU
 
     if state == "settings:name":
-        name = text.strip().split()[0].capitalize()
+        words = text.strip().split()
+        if not words:
+            return "Please type a name:"
+        name = words[0].capitalize()
         _update_identity_field(phone, "## Name", name)
         memory.set_menu_state(phone, None)
         return f"✓ Name updated to *{name}*."
@@ -407,7 +413,8 @@ def _handle_menu_nav(phone: str, session: dict, text: str) -> str:
             sched.reschedule_user(phone, session["schedule"])
         except Exception:
             logger.warning("Reschedule failed for %s after timezone change", phone)
-        return f"✓ Timezone set to *{tz}*."
+        note = " _(Could not resolve location — using UTC. Try a major city name.)_" if tz == "UTC" else ""
+        return f"✓ Timezone set to *{tz}*.{note}"
 
     if state == "settings:occupation":
         _update_identity_field(phone, "## Occupation", text.strip())
@@ -431,7 +438,7 @@ def _handle_chat(phone: str, text: str) -> str:
     deep = text.lower().startswith("deep:")
     if deep:
         text = text[5:].strip()
-    reply = agent.run(phone, text, heartbeat=False)
+    reply = agent.run(phone, text, heartbeat=False, deep=deep)
     memory.increment_msg(phone)
     return reply or "I have nothing to add."
 
